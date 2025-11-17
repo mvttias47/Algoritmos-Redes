@@ -54,6 +54,11 @@
     </div>
     <div class="row" id="amenazas-info" style="font-size:12px;color:#333"></div>
 
+    <!-- NUEVO: archivo con prob. de fallo por enlace/nodo (punto 4) -->
+    <div class="row">
+      <button id="btn-export-prob" type="button">Descargar prob. enlaces/nodos</button>
+    </div>
+
     <hr>
     <div class="row"><b>Infra:</b> <span id="infra-count">—</span></div>
     <div class="row"><b>Bebederos:</b> <span id="beb-count">—</span></div>
@@ -75,6 +80,9 @@
 
     const infraLayer = L.layerGroup();
     const bebLayer   = L.layerGroup();
+
+    // NUEVO: guardamos todos los enlaces de infraestructura para el punto 4
+    let infraData = null;
 
     const infraCountEl = document.getElementById('infra-count');
     const bebCountEl   = document.getElementById('beb-count');
@@ -104,12 +112,15 @@
         '/json/infra_provi_sector_east.geojson'
       ];
       const added=[];
+      infraData = { type: 'FeatureCollection', features: [] }; // reiniciamos cache
+
       for(const url of urls){
         try{
           const g = await safeFetch(url);
           if(!g?.features?.length) continue;
           total += g.features.length;
           added.push(L.geoJSON(g,{style:()=>({weight:2})}));
+          infraData.features = infraData.features.concat(g.features);
         }catch(e){ logErr(e.message); }
       }
       added.forEach(l=>infraLayer.addLayer(l));
@@ -280,7 +291,7 @@
     });
   </script>
 
-  <!-- RUTA + RUTA ALTERNATIVA + SIMULACIÓN AMENAZAS -->
+  <!-- RUTA + RUTA ALTERNATIVA + SIMULACIÓN AMENAZAS + EXPORT PROB -->
   <script>
     // Capas de rutas
     const routeLayer   = L.layerGroup().addTo(map);
@@ -490,6 +501,7 @@
 
       if (!uvData || !uvData.features || !uvData.features.length) {
         amenazasInfo.textContent = 'No hay datos de UV para simular amenazas.';
+        lastAmenazasFC = { type:'FeatureCollection', features:[] };
         return;
       }
 
@@ -572,6 +584,138 @@
 
     btnSimAmenazas.addEventListener('click', () => {
       simularAmenazas();
+    });
+
+    // ====== NUEVO: ARCHIVO CON PROB. DE FALLO POR ENLACE Y NODO (PUNTO 4) ======
+    const btnExportProb = document.getElementById('btn-export-prob');
+
+    // Busca el UV y Temp de la celda donde cae un punto
+    function uvTempEnPunto(lon, lat) {
+      const pt = turf.point([lon, lat]);
+      let uv = null;
+      let temp = null;
+
+      if (uvData && uvData.features) {
+        for (const f of uvData.features) {
+          try {
+            if (turf.booleanPointInPolygon(pt, f)) {
+              uv = f.properties ? f.properties.uv_index : null;
+              break;
+            }
+          } catch(_) {}
+        }
+      }
+      if (tempData && tempData.features) {
+        for (const f of tempData.features) {
+          try {
+            if (turf.booleanPointInPolygon(pt, f)) {
+              temp = f.properties ? f.properties.temp_c : null;
+              break;
+            }
+          } catch(_) {}
+        }
+      }
+      return { uv, temp };
+    }
+
+    async function exportProbabilidadesEnlacesNodos() {
+      // aseguramos que todo esté cargado
+      if (!infraData) await loadInfra();
+      if (!uvData)    await loadUV();
+      if (!tempData)  await loadTemp();
+
+      if (!infraData || !infraData.features || !infraData.features.length) {
+        alert('No hay datos de infraestructura para generar el archivo.');
+        return;
+      }
+
+      const linkFeatures = [];
+      const nodeMap = {}; // key "lon,lat" -> coords
+
+      // Enlaces: usamos el centro geométrico de cada segmento
+      for (const f of infraData.features) {
+        if (!f.geometry) continue;
+        const geom = f.geometry;
+
+        if (geom.type === 'LineString' || geom.type === 'MultiLineString') {
+          const center = turf.centerOfMass(f);
+          const [lon, lat] = center.geometry.coordinates;
+          const { uv, temp } = uvTempEnPunto(lon, lat);
+          const prob = probDesdeUVTemp(uv, temp);
+
+          const linkFeat = {
+            type: 'Feature',
+            geometry: JSON.parse(JSON.stringify(geom)),
+            properties: {
+              ...(f.properties || {}),
+              tipo_elemento: 'enlace',
+              prob_falla: prob,
+              uv,
+              temp
+            }
+          };
+          linkFeatures.push(linkFeat);
+
+          // Noditos: extremos de cada LineString
+          if (geom.type === 'LineString') {
+            const coords = geom.coordinates;
+            const extremos = [coords[0], coords[coords.length - 1]];
+            extremos.forEach(([x,y])=>{
+              const key = x.toFixed(6)+','+y.toFixed(6);
+              if (!nodeMap[key]) nodeMap[key] = [x,y];
+            });
+          } else if (geom.type === 'MultiLineString') {
+            geom.coordinates.forEach(ls=>{
+              const extremos = [ls[0], ls[ls.length-1]];
+              extremos.forEach(([x,y])=>{
+                const key = x.toFixed(6)+','+y.toFixed(6);
+                if (!nodeMap[key]) nodeMap[key] = [x,y];
+              });
+            });
+          }
+        }
+      }
+
+      // Nodos: cada punto extremo con su probabilidad
+      const nodeFeatures = [];
+      for (const key of Object.keys(nodeMap)) {
+        const [lon, lat] = nodeMap[key];
+        const { uv, temp } = uvTempEnPunto(lon, lat);
+        const prob = probDesdeUVTemp(uv, temp);
+
+        nodeFeatures.push({
+          type: 'Feature',
+          geometry: { type: 'Point', coordinates: [lon, lat] },
+          properties: {
+            tipo_elemento: 'nodo',
+            prob_falla: prob,
+            uv,
+            temp
+          }
+        });
+      }
+
+      const fc = {
+        type: 'FeatureCollection',
+        features: linkFeatures.concat(nodeFeatures)
+      };
+
+      const blob = new Blob([JSON.stringify(fc)], { type: 'application/geo+json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'prob_falla_enlaces_nodos.geojson';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      amenazasInfo.textContent =
+        `Archivo generado: ${linkFeatures.length} enlaces y ${nodeFeatures.length} nodos con prob. de falla.`;
+    }
+
+    btnExportProb.addEventListener('click', () => {
+      exportProbabilidadesEnlacesNodos();
     });
 
     // CARGAS INICIALES
