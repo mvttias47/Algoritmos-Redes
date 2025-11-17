@@ -3,7 +3,8 @@ set -euo pipefail
 
 echo "[1/6] Levantando stack (db, app, web)…"
 # 'docker compose up' AHORA tendrá éxito porque los volúmenes son correctos
-docker compose up -d --build
+DOCKER_BUILDKIT=0 COMPOSE_DOCKER_CLI_BUILD=0 docker compose up -d --build
+
 
 echo "[2/6] Ejecutando ETL (amenazas y metadata) en contenedor 'app'…"
 docker compose exec app python3 etl/amenazas/extract_openmeteo_temp_grid.py

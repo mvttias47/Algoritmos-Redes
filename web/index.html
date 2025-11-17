@@ -9,7 +9,12 @@
   <script src="https://cdn.jsdelivr.net/npm/suncalc@1.9.0/suncalc.min.js"></script>
   <style>
     html,body,#map{height:100%;margin:0}
-    .panel{position:absolute;z-index:1000;top:10px;left:10px;background:#fff;padding:10px 12px;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.15);font:14px system-ui,Segoe UI,Roboto,Arial;min-width:260px}
+    .panel{
+      position:absolute;z-index:1000;top:10px;left:10px;
+      background:#fff;padding:10px 12px;border-radius:6px;
+      box-shadow:0 2px 8px rgba(0,0,0,.15);
+      font:14px system-ui,Segoe UI,Roboto,Arial;min-width:260px
+    }
     .row{margin:.35rem 0}
     .err{color:#b00020;font-weight:600}
     .ok{color:#0a7d33}
@@ -24,11 +29,31 @@
     <div class="row"><label><input id="chk-uv" type="checkbox" checked> UV (grilla)</label></div>
     <div class="row"><label><input id="chk-temp" type="checkbox" checked> Temperatura (grilla)</label></div>
     <div class="row"><label><input id="chk-sombra" type="checkbox" checked> Sombra (12:00)</label></div>
+
+    <!-- Ruta base con pgr_dijkstra (lógica original) -->
     <div class="row">
       <label><input id="chk-route" type="checkbox"> Ruta (pgr_dijkstra)</label>
       <button id="btn-route-reset" type="button" style="margin-left:.5rem">Reset</button>
     </div>
+
+    <!-- Ruta alternativa construida a partir de amenazas (punto 8) -->
+    <div class="row">
+      <label><input id="chk-route-alt" type="checkbox"> Ruta alternativa (ejemplo de caso)</label>
+    </div>
+
     <div class="row" id="route-info" style="font-size:12px;color:#333"></div>
+
+    <!-- Simulación de amenazas (puntos 6 y 7) -->
+    <div class="row">
+      <label><input id="chk-amenazas-sim" type="checkbox"> Amenazas posibles (simulación)</label>
+    </div>
+    <div class="row">
+      Umbral falla (%):
+      <input id="umbral-falla" type="number" min="0" max="100" value="50" style="width:60px">
+      <button id="btn-simular-amenazas" type="button" style="margin-left:.5rem">Simular</button>
+    </div>
+    <div class="row" id="amenazas-info" style="font-size:12px;color:#333"></div>
+
     <hr>
     <div class="row"><b>Infra:</b> <span id="infra-count">—</span></div>
     <div class="row"><b>Bebederos:</b> <span id="beb-count">—</span></div>
@@ -39,12 +64,14 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
+  <!-- MAPA BASE + INFRA/BEBEDEROS -->
   <script>
-    // --- MAPA BASE PRIMERO (antes de cualquier uso de `map`) ---
     document.getElementById('url').textContent = window.location.pathname;
 
     const map = L.map('map').setView([-33.431,-70.618], 15);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OSM'}).addTo(map);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+      maxZoom:19,attribution:'© OSM'
+    }).addTo(map);
 
     const infraLayer = L.layerGroup();
     const bebLayer   = L.layerGroup();
@@ -55,7 +82,8 @@
 
     function logErr(msg){
       console.error(msg);
-      const div=document.createElement('div'); div.textContent=msg;
+      const div=document.createElement('div');
+      div.textContent=msg;
       errorsEl.appendChild(div);
     }
 
@@ -125,8 +153,11 @@
     });
   </script>
 
+  <!-- TEMPERATURA -->
   <script>
-    // --- Choropleth de temperatura ---
+    // guardamos los datos en memoria para la simulación
+    let tempData = null;
+
     function tempColor(t){
       if (t==null) return '#bbbbbb';
       if (t < 5)  return '#313695';
@@ -158,6 +189,7 @@
         const r = await fetch('/json/amenaza_temp_grid.geojson?v='+Date.now());
         if(!r.ok) throw new Error('GET amenaza_temp_grid.geojson '+r.status);
         const g = await r.json();
+        tempData = g;   // guardamos para la simulación
         const grid = L.geoJSON(g, {
           style: f => ({ color:'#666', weight:0.5, fillOpacity:0.6, fillColor: tempColor(f.properties?.temp_c) }),
           onEachFeature: (f,l) => l.bindTooltip(`T: ${f.properties?.temp_c ?? 'n/a'} °C`)
@@ -173,8 +205,11 @@
     });
   </script>
 
+  <!-- UV -->
   <script>
-    // --- UV ---
+    // guardamos también los datos de UV
+    let uvData = null;
+
     function uvColor(u){
       if (u==null) return '#bbbbbb';
       if (u < 3)  return '#2dc937';
@@ -202,6 +237,7 @@
         const r = await fetch('/json/amenaza_uv_grid.geojson?v='+Date.now());
         if(!r.ok) throw new Error('GET amenaza_uv_grid.geojson '+r.status);
         const g = await r.json();
+        uvData = g;   // guardamos para la simulación
         const grid = L.geoJSON(g, {
           style: f => ({ color:'#666', weight:0.5, fillOpacity:0.55, fillColor: uvColor(f.properties?.uv_index) }),
           onEachFeature: (f,l) => l.bindTooltip(`UV: ${f.properties?.uv_index ?? 'n/a'}`)
@@ -217,8 +253,8 @@
     });
   </script>
 
+  <!-- SOMBRA -->
   <script>
-    // --- Sombras precalculadas ---
     const sombraPolysLayer = L.layerGroup();
     const sombraRoadsLayer = L.layerGroup();
     async function loadSombraStatic(){
@@ -244,23 +280,32 @@
     });
   </script>
 
+  <!-- RUTA + RUTA ALTERNATIVA + SIMULACIÓN AMENAZAS -->
   <script>
-    // --- RUTA: este bloque VA DESPUÉS de crear el `map` ---
+    // Capas de rutas
     const routeLayer   = L.layerGroup().addTo(map);
     const routeMarkers = L.layerGroup().addTo(map);
+    const routeAltLayer = L.layerGroup();  // ruta alternativa ejemplo (punto 8)
 
     let routingMode = false;
     let picks = [];
 
-    const chkRoute = document.getElementById('chk-route');
-    const btnReset = document.getElementById('btn-route-reset');
-    const routeInfo = document.getElementById('route-info');
+    const chkRoute   = document.getElementById('chk-route');
+    const btnReset   = document.getElementById('btn-route-reset');
+    const routeInfo  = document.getElementById('route-info');
+    const chkRouteAlt = document.getElementById('chk-route-alt');
+
+    // geojson de la última ruta base calculada (pgr_dijkstra)
+    let lastRouteGeo = null;
+    // geojson de las últimas amenazas simuladas (celdas rojas)
+    let lastAmenazasFC = null;
 
     function resetRoute() {
       picks = [];
       routeLayer.clearLayers();
       routeMarkers.clearLayers();
       routeInfo.textContent = '';
+      lastRouteGeo = null;
     }
 
     async function requestRoute() {
@@ -274,21 +319,22 @@
         const geo = await r.json();
         routeLayer.clearLayers();
 
-        // Manejo de “geometry:null” (no hay ruta en el grafo)
         const geom = geo?.features?.[0]?.geometry || null;
         if (!geom) {
           routeInfo.textContent = 'Sin ruta posible entre los puntos (grafo desconectado).';
+          lastRouteGeo = null;
           return;
         }
 
-        const route = L.geoJSON(geo, {style:{color:'#ff006e', weight:5}});
+        const route = L.geoJSON(geo, {style:{color:'#ff00ff', weight:5}}); // fucsia continua
         routeLayer.addLayer(route);
         try { map.fitBounds(route.getBounds(), {padding:[20,20]}); } catch(_){}
         routeInfo.textContent = `Ruta lista ${src} → ${dst}`;
+        lastRouteGeo = geo;  // guardamos para construir la alternativa
       } catch(e) {
-        // Si ves “TypeError: Failed to fetch” aquí, es CORS (puertos 8080→8000)
         routeInfo.textContent = `Error: ${e.message}`;
         console.error(e);
+        lastRouteGeo = null;
       }
     }
 
@@ -325,7 +371,210 @@
       if (routingMode) routeInfo.textContent = 'Haz 2 clics en el mapa (origen y destino).';
     });
 
-    // --- CARGAS INICIALES ---
+    // Construcción de ruta alternativa usando amenazas simuladas
+    function buildAltRouteFromThreats() {
+      routeAltLayer.clearLayers();
+
+      if (!lastRouteGeo || !lastRouteGeo.features || !lastRouteGeo.features.length) {
+        routeInfo.textContent = 'Primero calcula una ruta base con pgr_dijkstra.';
+        return;
+      }
+      if (!lastAmenazasFC || !lastAmenazasFC.features || !lastAmenazasFC.features.length) {
+        routeInfo.textContent = 'Primero ejecuta la simulación de amenazas.';
+        return;
+      }
+
+      const feat = lastRouteGeo.features[0];
+      const geom = feat.geometry;
+      if (!geom || geom.type !== 'LineString') {
+        routeInfo.textContent = 'Formato de ruta no soportado para alternativa.';
+        return;
+      }
+
+      const coords = geom.coordinates; // [ [lon,lat], ... ]
+      const threatPolys = lastAmenazasFC.features;
+
+      const altCoords = coords.map(([lon,lat]) => {
+        const pt = turf.point([lon,lat]);
+        let inside = false;
+        for (let i=0;i<threatPolys.length;i++) {
+          const poly = threatPolys[i];
+          try {
+            if (turf.booleanPointInPolygon(pt, poly)) {
+              inside = true;
+              break;
+            }
+          } catch(_) {}
+        }
+        if (inside) {
+          // desplazamos el punto fuera de la celda roja (ejemplo simple NE)
+          const shift = 0.0015; // ~150 m aprox
+          return [lon + shift, lat + shift];
+        }
+        return [lon,lat];
+      });
+
+      const altGeo = {
+        type: 'FeatureCollection',
+        features: [{
+          type: 'Feature',
+          geometry: { type: 'LineString', coordinates: altCoords },
+          properties: {
+            tipo: 'ruta_alternativa',
+            descripcion: 'Ruta alternativa que rodea celdas con alta amenaza modelada.'
+          }
+        }]
+      };
+
+      const capa = L.geoJSON(altGeo, {
+        style: {
+          color: '#00ffff',      // celeste brillante
+          weight: 6,
+          dashArray: '10 6'      // bien discontinua
+        }
+      });
+
+      routeAltLayer.addLayer(capa);
+      routeAltLayer.addTo(map);
+      try { map.fitBounds(routeAltLayer.getBounds(), { padding:[20,20] }); } catch(_){}
+
+      routeInfo.textContent =
+        'Ruta alternativa generada evitando, en lo posible, las celdas rojas de amenaza.';
+    }
+
+    chkRouteAlt.addEventListener('change', (e) => {
+      if (e.target.checked) {
+        buildAltRouteFromThreats();
+      } else {
+        map.removeLayer(routeAltLayer);
+      }
+    });
+
+    // SIMULACIÓN DE AMENAZAS (puntos 6 y 7) usando UV + temperatura, sin archivos nuevos
+    const amenazasSimLayer = L.layerGroup();
+    const chkAmenazasSim   = document.getElementById('chk-amenazas-sim');
+    const btnSimAmenazas   = document.getElementById('btn-simular-amenazas');
+    const inputUmbral      = document.getElementById('umbral-falla');
+    const amenazasInfo     = document.getElementById('amenazas-info');
+
+    // función que modela probabilidad a partir de UV y temperatura
+    function probDesdeUVTemp(uv, temp) {
+      let pUV = 0, pT = 0;
+
+      // UV: inspirado en rangos OMS (más peso)
+      if (uv != null) {
+        if (uv < 3)       pUV = 5;
+        else if (uv < 6)  pUV = 25;
+        else if (uv < 8)  pUV = 45;
+        else if (uv < 11) pUV = 70;
+        else              pUV = 90;
+      }
+
+      // Temperatura: umbral de confort vs estrés térmico
+      if (temp != null) {
+        if (temp < 20)       pT = 5;
+        else if (temp < 25)  pT = 15;
+        else if (temp < 30)  pT = 35;
+        else if (temp < 35)  pT = 60;
+        else                 pT = 80;
+      }
+
+      // combinación: 70% UV, 30% temperatura
+      return Math.min(100, Math.round(pUV * 0.7 + pT * 0.3));
+    }
+
+    async function simularAmenazas() {
+      // aseguramos que tenemos datos (si algo falló en la carga inicial)
+      if (!uvData)  await loadUV();
+      if (!tempData) await loadTemp();
+
+      if (!uvData || !uvData.features || !uvData.features.length) {
+        amenazasInfo.textContent = 'No hay datos de UV para simular amenazas.';
+        return;
+      }
+
+      const umbral = Number(inputUmbral.value) || 0;
+      amenazasSimLayer.clearLayers();
+
+      const posibles = [];
+      const uvFeatures   = uvData.features || [];
+      const tempFeatures = (tempData && tempData.features) ? tempData.features : [];
+
+      const n = uvFeatures.length;
+
+      for (let i = 0; i < n; i++) {
+        const fUV   = uvFeatures[i];
+        const fTemp = tempFeatures[i] || null;
+
+        const uv   = fUV.properties ? fUV.properties.uv_index   : null;
+        const temp = fTemp && fTemp.properties ? fTemp.properties.temp_c : null;
+
+        const prob = probDesdeUVTemp(uv, temp);
+        const rand = Math.random() * 100; // requisito del enunciado
+        const ocurre = (rand <= prob) && (prob >= umbral);
+
+        if (ocurre) {
+          // Clonamos el feature para no tocar la capa original
+          const feat = JSON.parse(JSON.stringify(fUV));
+          feat.properties = {
+            ...(feat.properties || {}),
+            amenaza: 'Estrés térmico / radiación UV',
+            prob_modelada: prob,
+            detalle: `UV=${uv ?? 'n/a'} | Temp=${temp ?? 'n/a'}`
+          };
+          posibles.push(feat);
+        }
+      }
+
+      if (!posibles.length) {
+        amenazasInfo.textContent = 'Ninguna celda supera el umbral de falla con la simulación actual.';
+        map.removeLayer(amenazasSimLayer);
+        lastAmenazasFC = { type:'FeatureCollection', features:[] };
+        return;
+      }
+
+      const fc = { type: 'FeatureCollection', features: posibles };
+      lastAmenazasFC = fc; // guardamos para construir la ruta alternativa
+
+      const capa = L.geoJSON(fc, {
+        style: () => ({ color: '#ff0000', weight: 3 }),
+        onEachFeature: (f, layer) => {
+          const p = f.properties || {};
+          const prob = p.prob_modelada ?? '?';
+          layer.bindPopup(
+            `<b>${p.amenaza || 'Amenaza'}</b><br>` +
+            `Prob. falla modelada: ${prob}%<br>` +
+            (p.detalle ? p.detalle : '')
+          );
+        }
+      });
+
+      amenazasSimLayer.addLayer(capa);
+
+      if (chkAmenazasSim.checked) {
+        amenazasSimLayer.addTo(map);
+        try { map.fitBounds(amenazasSimLayer.getBounds(), { padding: [20, 20] }); } catch (_) {}
+      } else {
+        map.removeLayer(amenazasSimLayer);
+      }
+
+      amenazasInfo.textContent =
+        `Amenazas que podrían ocurrir (simulación): ${posibles.length} (umbral ${umbral}%)`;
+    }
+
+    chkAmenazasSim.addEventListener('change', (e) => {
+      if (e.target.checked) {
+        amenazasSimLayer.addTo(map);
+      } else {
+        map.removeLayer(amenazasSimLayer);
+      }
+    });
+
+    btnSimAmenazas.addEventListener('click', () => {
+      simularAmenazas();
+    });
+
+    // CARGAS INICIALES
     (async()=>{
       await loadInfra();
       await loadBeb();
